@@ -1,46 +1,42 @@
-# File: utils/kite_session.py
+# utils/kite_session.py
+"""
+Kite Connect Session Manager for the AlphaPivot Trading System.
 
-import configparser
+This module provides a centralized function for loading an authenticated
+KiteConnect session from the main `config.ini` file.
+"""
+from __future__ import annotations
+
+from .configs import get_config_parser
 from kiteconnect import KiteConnect
 
 def load_kite() -> KiteConnect:
     """
-    Loads KiteConnect session from saved config file.
-    """# File: utils/kite_session.py
-# Purpose: Load an authenticated KiteConnect session from zerodha.ini
+    Loads an authenticated KiteConnect session from the config file.
 
-import os
-import configparser
-from kiteconnect import KiteConnect
+    This function reads the `[kite]` section of the `config.ini` file to
+    get the API key and access token, and then returns an authenticated
+    KiteConnect object.
 
-CONFIG_PATH = os.getenv("ZCONFIG", "zerodha.ini")
+    Returns:
+        An authenticated KiteConnect session object.
 
-def load_kite() -> KiteConnect:
+    Raises:
+        KeyError: If the `api_key` or `access_token` is missing from the
+                  `[kite]` section of the configuration file.
     """
-    Load an authenticated KiteConnect session from the INI file.
-    Raises a clear error if keys are missing.
-    """
-    if not os.path.exists(CONFIG_PATH):
-        raise FileNotFoundError(f"❌ Config file not found: {CONFIG_PATH}")
-
-    config = configparser.ConfigParser()
-    config.read(CONFIG_PATH)
+    config = get_config_parser()
+    if "kite" not in config:
+        raise KeyError("Missing [kite] section in config.ini")
 
     try:
         api_key = config["kite"]["api_key"]
         access_token = config["kite"]["access_token"]
     except KeyError as e:
-        raise KeyError(f"❌ Missing required key in [kite] section: {e}")
+        raise KeyError(f"Missing required key in [kite] section: {e}")
 
-    kite = KiteConnect(api_key=api_key)
-    kite.set_access_token(access_token)
-    return kite
-
-    config = configparser.ConfigParser()
-    config.read("zerodha.ini")
-    
-    api_key = config["kite"]["api_key"]
-    access_token = config["kite"]["access_token"]
+    if not api_key or not access_token or "your_" in api_key:
+        raise ValueError("API key or access token not configured in config.ini")
 
     kite = KiteConnect(api_key=api_key)
     kite.set_access_token(access_token)

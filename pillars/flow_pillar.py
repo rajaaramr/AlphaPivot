@@ -7,7 +7,7 @@ import pandas as pd
 
 from .common import (  # your shared utils
     ema, atr, adx, obv_series, resample, last_metric, write_values, clamp,
-    TZ, DEFAULT_INI, BaseCfg
+    TZ, DEFAULT_INI, BaseCfg, eval_expr
 )
 from pillars.common import min_bars_for_tf, ensure_min_bars, maybe_trim_last_bar
 
@@ -82,11 +82,6 @@ def _hh_hl(series: pd.Series, look:int=20) -> bool:
     hh = float(series.iloc[-1]) >= float(series.rolling(look).max().iloc[-2])
     slope = float(series.iloc[-1] - series.iloc[-look]) > 0
     return bool(hh and slope)
-
-def _safe_eval(expr: str, scope: Dict[str, Any]) -> bool:
-    if not expr or not expr.strip():
-        return False
-    return bool(eval(expr, {"__builtins__": {}}, scope))
 
 
 # -----------------------------
@@ -309,7 +304,7 @@ def _run_scenarios(features: Dict[str, Any], cfg: dict) -> Tuple[float, bool, Di
 
     for name in cfg["scenarios_list"]:
         sec = f"flow_scenario.{name}"
-        if not cp.has_section(sec): 
+        if not cp.has_section(sec):
             continue
         when = cp.get(sec, "when", fallback="").strip()
         if not when:
@@ -317,7 +312,7 @@ def _run_scenarios(features: Dict[str, Any], cfg: dict) -> Tuple[float, bool, Di
 
         ok = False
         try:
-            ok = _safe_eval(when, features)
+            ok = eval_expr(when, features)
         except Exception:
             ok = False
         if not ok:
@@ -330,7 +325,7 @@ def _run_scenarios(features: Dict[str, Any], cfg: dict) -> Tuple[float, bool, Di
 
         if cp.has_option(sec, "bonus_when"):
             try:
-                if _safe_eval(cp.get(sec, "bonus_when"), features):
+                if eval_expr(cp.get(sec, "bonus_when"), features):
                     bonus_val = float(cp.get(sec, "bonus", fallback="0").strip() or 0.0)
                     total = (bonus_val if cfg["rules_mode"] == "override" else (total + bonus_val))
                     parts[name + ".bonus"] = bonus_val

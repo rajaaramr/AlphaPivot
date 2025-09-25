@@ -1,16 +1,23 @@
 # utils/db_ops.py
-# Centralized DB helpers for Postgres/Timescale.
-# - Safe UPSERTs with ON CONFLICT / row-exists guard
-# - UTC-aware timestamps
-# - Explicit commits on all writers
-# - Helpers for options + dashboards
+"""
+Centralized database operations for the AlphaPivot trading system.
 
+This module provides a collection of helper functions for interacting with the
+PostgreSQL/TimescaleDB database. It handles common tasks such as inserting
+market data, logging run statuses, and fetching data for dashboards.
+
+Key features:
+- Safe UPSERTs using ON CONFLICT or row-existence checks.
+- UTC-aware timestamp handling for all database operations.
+- Explicit commits on all writer functions to ensure data integrity.
+"""
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, Optional, Iterable, Tuple, Literal
 from datetime import datetime, timezone
 from utils.db import get_db_connection
-import psycopg2.extras as pgx  # used by snapshot_universe
+import psycopg2.extras as pgx
 
 # ---------------------------------
 # Constants
@@ -22,6 +29,17 @@ DEFAULT_INTERVAL = "5m"
 # Helpers
 # ---------------------------------
 def _as_aware_utc(ts_in) -> datetime:
+    """
+    Converts a timestamp input into a timezone-aware UTC datetime object.
+
+    Handles integers, floats, strings, and naive datetime objects.
+
+    Args:
+        ts_in: The timestamp to convert.
+
+    Returns:
+        A timezone-aware datetime object in UTC.
+    """
     try:
         if isinstance(ts_in, datetime):
             dt = ts_in
@@ -43,10 +61,37 @@ def _as_aware_utc(ts_in) -> datetime:
     except Exception:
         return datetime.now(TZ)
 
+def json_dumps(obj) -> str:
+    """
+    Safely serializes a Python object to a JSON string.
+
+    Args:
+        obj: The object to serialize.
+
+    Returns:
+        A JSON string representation of the object, or an empty JSON object
+        string ("{}") if serialization fails.
+    """
+    try:
+        return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    except Exception:
+        return "{}"
+
 def log_run_status(*, run_id: str, job: str, symbol: str | None,
                    phase: str, status: str, error_code: str | None = None,
                    info: dict | None = None) -> None:
-    from utils.db import get_db_connection
+    """
+    Logs the status of a job run to the journal.run_status table.
+
+    Args:
+        run_id: The unique identifier for the run.
+        job: The name of the job being run.
+        symbol: The symbol being processed, if applicable.
+        phase: The current phase of the job (e.g., "START", "FINISH").
+        status: The status of the job (e.g., "SUCCESS", "FAIL").
+        error_code: An optional error code if the job failed.
+        info: An optional dictionary of additional information.
+    """
     with get_db_connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -59,18 +104,12 @@ def log_run_status(*, run_id: str, job: str, symbol: str | None,
         conn.commit()
 
 def _row_exists(cur, table: str, symbol: str, interval: str, ts: datetime) -> bool:
+    """Checks if a specific row exists in a given table."""
     cur.execute(
         f"SELECT 1 FROM {table} WHERE symbol=%s AND interval=%s AND ts=%s LIMIT 1",
         (symbol, interval, ts),
     )
     return cur.fetchone() is not None
-
-def json_dumps(obj) -> str:
-    import json as _json
-    try:
-        return _json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
-    except Exception:
-        return "{}"
 
 # ---------------------------------
 # INSERTS / UPSERTS
@@ -88,6 +127,25 @@ def insert_futures_price(
     interval: str = DEFAULT_INTERVAL,
     source: Optional[str] = None,
 ) -> None:
+    """
+    Inserts or updates a futures price candle in the database.
+
+    This function performs an "upsert" operation: if a candle for the given
+    symbol, interval, and timestamp already exists, it will be updated.
+    Otherwise, a new record will be inserted.
+
+    Args:
+        ts: The timestamp of the candle.
+        symbol: The futures symbol.
+        open: The opening price.
+        high: The highest price.
+        low: The lowest price.
+        close: The closing price.
+        volume: The trading volume.
+        oi: The open interest.
+        interval: The candle interval (e.g., "5m", "15m").
+        source: The data source.
+    """
     ts = _as_aware_utc(ts)
     volume = float(volume or 0.0)
     oi = int(oi or 0)
@@ -128,6 +186,22 @@ def insert_spot_price(
     interval: str = DEFAULT_INTERVAL,
     source: Optional[str] = None,
 ) -> None:
+    """
+    Inserts or updates a spot price candle in the database.
+
+    This function performs an "upsert" operation for spot price data.
+
+    Args:
+        ts: The timestamp of the candle.
+        symbol: The spot symbol.
+        open: The opening price.
+        high: The highest price.
+        low: The lowest price.
+        close: The closing price.
+        volume: The trading volume.
+        interval: The candle interval.
+        source: The data source.
+    """
     ts = _as_aware_utc(ts)
     volume = float(volume or 0.0)
 
@@ -154,9 +228,6 @@ def insert_spot_price(
             )
         conn.commit()
 
-# (… keep the rest of your file exactly as before: option_chain, snapshots,
-#  upsert_volume_zone, fetch_latest_snapshots, fetch_latest_zone_data, dashboard, adapters …)
-
 # ---------------------------------
 # Adapters (compat with older code)
 # ---------------------------------
@@ -166,21 +237,33 @@ def insert_webhook_alert(
     status: str = "PENDING", signal_type: Optional[str] = None,
     strategy_version: Optional[str] = None, rule_version: Optional[str] = None,
 ) -> str:
-    # keep this helper here so the function is importable
-    def _json_dumps(obj) -> str:
-        import json as _json
-        try:
-            return _json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
-        except Exception:
-            return "{}"
+    """
+    Inserts a new webhook alert into the database.
 
+    This function is designed to handle alerts from external sources like
+    TradingView and store them for processing.
+
+    Args:
+        symbol: The symbol associated with the alert.
+        strategy_name: The name of the strategy that generated the alert.
+        payload_json: The raw JSON payload of the alert.
+        timeframe: The timeframe of the alert.
+        source: The source of the alert.
+        status: The initial status of the alert.
+        signal_type: The type of signal.
+        strategy_version: The version of the strategy.
+        rule_version: The version of the rule.
+
+    Returns:
+        The unique ID of the inserted alert.
+    """
     # embed extras into payload for audit
     if isinstance(payload_json, dict):
         pj = dict(payload_json)
         if signal_type is not None:        pj.setdefault("signal_type", signal_type)
         if strategy_version is not None:   pj.setdefault("strategy_version", strategy_version)
         if rule_version is not None:       pj.setdefault("rule_version", rule_version)
-        payload = _json_dumps(pj)
+        payload = json_dumps(pj)
     else:
         payload = str(payload_json)
 
@@ -200,11 +283,17 @@ def insert_webhook_alert(
 
 def get_dashboard_rows(limit_alerts: int = 20, limit_trades: int = 20) -> Dict[str, Any]:
     """
+    Fetches data for the main dashboard.
+
+    This function retrieves a summary of the system's status, including
+    counts of open trades and recent alerts.
+
+    Args:
+        limit_alerts: The maximum number of recent alerts to fetch.
+        limit_trades: The maximum number of recent trades to fetch.
+
     Returns:
-      - counts: open trades, pending alerts, rejected today
-      - recent_alerts: latest alerts (symbol, status, ts)
-      - recent_trades: latest trades (symbol, side, status, entry_ts, exit_ts, score)
-    Uses: journal.trading_journal, webhooks.webhook_alerts
+        A dictionary containing dashboard data.
     """
     out: Dict[str, Any] = {
         "counts": {"open_trades": 0, "pending_alerts": 0, "rejected_today": 0},
@@ -273,6 +362,10 @@ def get_dashboard_rows(limit_alerts: int = 20, limit_trades: int = 20) -> Dict[s
 
 
 def insert_futures_bar(*, symbol, interval, ts, open_price, high_price, low_price, close_price, volume, oi):
+    """
+    Adapter function to insert a futures bar with keyword arguments matching
+    a different convention.
+    """
     insert_futures_price(
         ts=ts, symbol=symbol,
         open=open_price, high=high_price, low=low_price, close=close_price,
@@ -280,6 +373,10 @@ def insert_futures_bar(*, symbol, interval, ts, open_price, high_price, low_pric
     )
 
 def insert_spot_bar(*, symbol, interval, ts, open_price, high_price, low_price, close_price, volume):
+    """
+    Adapter function to insert a spot bar with keyword arguments matching
+    a different convention.
+    """
     insert_spot_price(
         ts=ts, symbol=symbol,
         open=open_price, high=high_price, low=low_price, close=close_price,

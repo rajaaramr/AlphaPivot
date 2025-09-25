@@ -9,22 +9,10 @@ import pandas as pd
 # Your shared helpers (unchanged contracts)
 from .common import (  # expects these to exist exactly as before
     DEFAULT_INI, BaseCfg, TZ,
-    ema, adx, atr, resample, last_metric, write_values, clamp
+    ema, adx, atr, resample, last_metric, write_values, clamp,
+    rsi, eval_expr
 )
 from pillars.common import min_bars_for_tf, ensure_min_bars, maybe_trim_last_bar
-
-
-# -----------------------------
-# Small helper: RSI (for divergence scenarios)
-# -----------------------------
-def _rsi(series: pd.Series, win: int = 14) -> pd.Series:
-    delta = series.diff()
-    up = delta.clip(lower=0.0)
-    down = (-delta).clip(lower=0.0)
-    roll_up = up.ewm(alpha=1.0 / win, adjust=False).mean()
-    roll_down = down.ewm(alpha=1.0 / win, adjust=False).mean()
-    rs = roll_up / roll_down.replace(0, np.nan)
-    return 100.0 - (100.0 / (1.0 + rs))
 
 
 # -----------------------------
@@ -122,7 +110,7 @@ def _trend_features(dtf: pd.DataFrame, cfg: dict, vp: Dict[str, Optional[float]]
     roc = c.pct_change(cfg["roc_win"])
 
     # RSI + divergence helpers
-    rsi_series = _rsi(c, 14)
+    rsi_series = rsi(c, 14)
     div_n = int(cfg.get("div_lookback", 5))
     idx_n = max(1, min(div_n, len(c) - 1))
 
@@ -200,17 +188,6 @@ def _trend_features(dtf: pd.DataFrame, cfg: dict, vp: Dict[str, Optional[float]]
         "poc_dist_atr": poc_dist_atr,
     }
     return feat
-
-
-# -----------------------------
-# Scenario evaluator
-# -----------------------------
-def _eval_expr(expr: str, F: dict) -> bool:
-    if not expr:
-        return False
-    safe_globals = {"__builtins__": None}
-    safe_locals = {k: F[k] for k in F}
-    return bool(eval(expr, safe_globals, safe_locals))
 
 
 # -----------------------------
@@ -329,10 +306,10 @@ def _trend_score(dtf: pd.DataFrame, vp: Dict[str, Optional[float]], cfg: dict) -
         scen_total = 0.0
         scen_parts = {}
         for sc in scenarios:
-            if _eval_expr(sc["when"], F):
+            if eval_expr(sc["when"], F):
                 scen_total += sc["score"]
                 scen_parts[f"SCN.{sc['name']}"] = float(sc["score"])
-                if sc.get("bonus_when") and _eval_expr(sc["bonus_when"], F):
+                if sc.get("bonus_when") and eval_expr(sc["bonus_when"], F):
                     scen_total += sc["bonus"]
                     scen_parts[f"SCN.{sc['name']}.bonus"] = float(sc["bonus"])
 
@@ -377,7 +354,7 @@ def score_trend(
         "val": last_metric(symbol, kind, tf, "VP.VAL"),
     }
 
-    score, parts = _trend_score(dftf, vp, cfg)
+    score, parts = _trend_score(dtf, vp, cfg)
 
     # Soft veto: ATR% > 15
     veto_soft = parts["atr_pct"] > cfg["atr_penalty_15"]
