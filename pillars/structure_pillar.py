@@ -1,80 +1,63 @@
-# scheduler/structure_pillar.py
+# pillars/structure_pillar.py
 from __future__ import annotations
-from pillars.common import (
-    TZ, DEFAULT_INI, load_base_cfg, load_5m, resample, write_values, last_metric, clamp, now_ts
-)
-import os, math, json, configparser
+
+import os
+import json
+import configparser
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Iterable
-from datetime import datetime, timedelta, timezone
-from pillars.common import min_bars_for_tf, ensure_min_bars, maybe_trim_last_bar
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
-import psycopg2.extras as pgx
 
+from .common import (
+    TZ, DEFAULT_INI as COMMON_DEFAULT_INI,
+    load_5m, resample, write_values, last_metric,
+    clamp, now_ts, ema, atr, bb_width_pct,
+    _as_list_csv as csv, _parse_weights as weights_map,
+    ensure_min_bars, maybe_trim_last_bar
+)
 from utils.db import get_db_connection
 
-TZ = timezone.utc
+# Use its own INI file by default
 DEFAULT_INI = os.getenv("STRUCTURE_INI", "structure.ini")
 
-TF_TO_OFFSET = {
-    "5m": "5min", "15m": "15min", "25m": "25min", "30m": "30min",
-    "65m": "65min", "125m": "125min", "250m": "250min"
-}
 
 # ========= Config =========
 
 @dataclass
 class StructCfg:
-    section: str                  # NEW: which INI section we loaded
-    metric_prefix: str            # NEW: "STRUCT" | "STRUCT.v2" etc.
+    section: str
+    metric_prefix: str
     tfs: List[str]
     lookback_days: int
-    mtf_weights: Dict[str, float]           # {"25m":0.3,"65m":0.3,"125m":0.4}
-    # sub-scores weights (sum ~ 1.0)
+    mtf_weights: Dict[str, float]
     w_stop: float
     w_reward: float
     w_trigger: float
     w_path: float
     w_anchor: float
-    # thresholds
-    near_anchor_atr: float                  # how close (in ATRs) counts as “near” support/res
+    near_anchor_atr: float
     min_stop_atr: float
     max_stop_atr: float
-    rr_bins: Tuple[float,float,float]       # RR cutoffs e.g. (1.0, 1.5, 2.0)
-    vol_surge_k: float                      # volume surge multiple vs 20-bar avg for breakout
-    squeeze_pct: float                      # BB width percentile gate for compression bonus
-    wick_clean_thr: float                   # wick/body < clean_thr -> clean
-    wick_dirty_thr: float                   # wick/body > dirty_thr -> penalty
-    # veto
-    veto_rr_floor: float                    # veto if RR < this
-    # run id/source
+    rr_bins: Tuple[float, float, float]
+    vol_surge_k: float
+    squeeze_pct: float
+    wick_clean_thr: float
+    wick_dirty_thr: float
+    veto_rr_floor: float
     run_id: str
     source: str
 
-def _csv(s: str) -> List[str]:
-    return [x.strip() for x in s.split(",") if x.strip()]
-
-def _weights_map(s: str) -> Dict[str, float]:
-    out: Dict[str,float] = {}
-    for part in _csv(s):
-        if ":" in part:
-            k,v = part.split(":",1)
-            try: out[k.strip()] = float(v.strip())
-            except: pass
-    ssum = sum(out.values()) or 1.0
-    return {k: v/ssum for k,v in out.items()}
-
 def load_cfg(ini_path: str = DEFAULT_INI, section: str = "structure") -> StructCfg:
-    cp = configparser.ConfigParser(inline_comment_prefixes=(";","#"), interpolation=None, strict=False)
+    cp = configparser.ConfigParser(inline_comment_prefixes=(";", "#"), interpolation=None, strict=False)
     cp.read(ini_path)
 
     sect = section
-    tfs = _csv(cp.get(sect, "tfs", fallback="25m,65m,125m"))
-    mtf_weights = _weights_map(cp.get(sect, "mtf_weights", fallback="25m:0.3,65m:0.3,125m:0.4"))
+    tfs = csv(cp.get(sect, "tfs", fallback="25m,65m,125m"))
+    mtf_weights = weights_map(cp.get(sect, "mtf_weights", fallback="25m:0.3,65m:0.3,125m:0.4"), tfs)
 
-    # NEW: allow namespacing metrics so variants don't overwrite each other.
-    # Default keeps old behavior: "STRUCT"
     metric_prefix = cp.get(sect, "metric_prefix", fallback="STRUCT")
 
     return StructCfg(
@@ -91,7 +74,7 @@ def load_cfg(ini_path: str = DEFAULT_INI, section: str = "structure") -> StructC
         near_anchor_atr=cp.getfloat(sect, "near_anchor_atr", fallback=0.75),
         min_stop_atr=cp.getfloat(sect, "min_stop_atr", fallback=0.5),
         max_stop_atr=cp.getfloat(sect, "max_stop_atr", fallback=3.0),
-        rr_bins=tuple(float(x) for x in _csv(cp.get(sect, "rr_bins", fallback="1.0,1.5,2.0"))[:3]) or (1.0,1.5,2.0),
+        rr_bins=tuple(float(x) for x in csv(cp.get(sect, "rr_bins", fallback="1.0,1.5,2.0"))[:3]) or (1.0,1.5,2.0),
         vol_surge_k=cp.getfloat(sect, "vol_surge_k", fallback=2.0),
         squeeze_pct=cp.getfloat(sect, "squeeze_pct", fallback=25.0),
         wick_clean_thr=cp.getfloat(sect, "wick_clean_thr", fallback=1.0),
@@ -101,104 +84,14 @@ def load_cfg(ini_path: str = DEFAULT_INI, section: str = "structure") -> StructC
         source=cp.get(sect, "source", fallback=os.getenv("SRC","structure")),
     )
 
-# ========= DB helpers =========
-
-def _exec_values(sql: str, rows: List[tuple]) -> int:
-    if not rows: return 0
-    with get_db_connection() as conn, conn.cursor() as cur:
-        pgx.execute_values(cur, sql, rows, page_size=1000)
-        conn.commit()
-        return len(rows)
-
-def _last_metric(symbol: str, kind: str, tf: str, metric: str) -> Optional[float]:
-    with get_db_connection() as conn, conn.cursor() as cur:
-        cur.execute("""
-            SELECT val FROM indicators.values
-             WHERE symbol=%s AND market_type=%s AND interval=%s AND metric=%s
-             ORDER BY ts DESC LIMIT 1
-        """, (symbol, kind, tf, metric))
-        row = cur.fetchone()
-    return float(row[0]) if row else None
-
-def _write_rows(rows: List[tuple]) -> int:
-    if not rows: return 0
-    sql = """
-        INSERT INTO indicators.values
-            (symbol, market_type, interval, ts, metric, val, context, run_id, source)
-        VALUES %s
-        ON CONFLICT (symbol, market_type, interval, ts, metric)
-        DO UPDATE SET
-            val=EXCLUDED.val, context=EXCLUDED.context, run_id=EXCLUDED.run_id, source=EXCLUDED.source
-    """
-    return _exec_values(sql, rows)
-
-# ========= Candle IO / Resample =========
-
-def _load_5m(symbol: str, kind: str, lookback_days: int) -> pd.DataFrame:
-    table = "market.futures_candles" if kind == "futures" else "market.spot_candles"
-    cutoff = datetime.now(TZ) - timedelta(days=lookback_days)
-    with get_db_connection() as conn, conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT ts, open, high, low, close, volume
-              FROM {table}
-             WHERE symbol=%s AND interval='5m' AND ts >= %s
-             ORDER BY ts ASC
-        """, (symbol, cutoff))
-        rows = cur.fetchall()
-    if not rows: return pd.DataFrame()
-    df = pd.DataFrame(rows, columns=["ts","open","high","low","close","volume"])
-    df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
-    df = df.dropna(subset=["ts"]).set_index("ts").sort_index()
-    for c in ["open","high","low","close","volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(how="any")
-    return df[~df.index.duplicated(keep="last")]
-
-def _resample(df5: pd.DataFrame, tf: str) -> pd.DataFrame:
-    if df5.empty: return df5
-    if tf == "5m": return df5.copy()
-    rule = TF_TO_OFFSET.get(tf)
-    if not rule: return pd.DataFrame()
-    out = pd.DataFrame({
-        "open":   df5["open"]  .resample(rule, label="right", closed="right").first(),
-        "high":   df5["high"]  .resample(rule, label="right", closed="right").max(),
-        "low":    df5["low"]   .resample(rule, label="right", closed="right").min(),
-        "close":  df5["close"] .resample(rule, label="right", closed="right").last(),
-        "volume": df5["volume"].resample(rule, label="right", closed="right").sum(),
-    }).dropna(how="any")
-    return out
-
-# ========= TA helpers =========
-
-def _ema(s: pd.Series, n:int) -> pd.Series:
-    return s.ewm(span=n, adjust=False).mean()
-
-def _true_range(h: pd.Series, l: pd.Series, c: pd.Series) -> pd.Series:
-    pc = c.shift(1)
-    tr = pd.concat([(h-l).abs(), (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
-    return tr
-
-def _atr(h: pd.Series, l: pd.Series, c: pd.Series, n:int=14) -> pd.Series:
-    return _true_range(h,l,c).ewm(alpha=1.0/n, adjust=False).mean()
-
-def _bb_width_pct(close: pd.Series, n:int=20, k:float=2.0) -> pd.Series:
-    ma = close.rolling(n, min_periods=max(5, n//2)).mean()
-    sd = close.rolling(n, min_periods=max(5, n//2)).std(ddof=1)
-    upper = ma + k*sd; lower = ma - k*sd
-    width = (upper - lower) / (ma.replace(0,np.nan).abs())
-    return 100.0 * width
-
 # ========= Core Structure scoring =========
-
-def _clamp01(x: float) -> float: return max(0.0, min(1.0, x))
-def _clamp100(x: float) -> float: return max(0.0, min(100.0, x))
 
 def _anchor_dict(symbol: str, kind: str, tf: str) -> Dict[str, Optional[float]]:
     return {
-        "poc": _last_metric(symbol, kind, tf, "VP.POC"),
-        "val": _last_metric(symbol, kind, tf, "VP.VAL"),
-        "vah": _last_metric(symbol, kind, tf, "VP.VAH"),
-        "bb_score": _last_metric(symbol, kind, tf, "BB.score"),
+        "poc": last_metric(symbol, kind, tf, "VP.POC"),
+        "val": last_metric(symbol, kind, tf, "VP.VAL"),
+        "vah": last_metric(symbol, kind, tf, "VP.VAH"),
+        "bb_score": last_metric(symbol, kind, tf, "BB.score"),
     }
 
 def _wick_body_ratio(o: float, h: float, l: float, c: float) -> float:
@@ -211,25 +104,25 @@ def _wick_body_ratio(o: float, h: float, l: float, c: float) -> float:
 
 def _dir_bias(close: pd.Series) -> int:
     # quick bias using EMA stack
-    ema10, ema20, ema50 = _ema(close,10), _ema(close,20), _ema(close,50)
+    ema10, ema20, ema50 = ema(close,10), ema(close,20), ema(close,50)
     if len(close) < 50: return 0
     if float(ema10.iloc[-1]) > float(ema20.iloc[-1]) > float(ema50.iloc[-1]): return +1
     if float(ema10.iloc[-1]) < float(ema20.iloc[-1]) < float(ema50.iloc[-1]): return -1
     return 0
 
-def _stop_and_target(close: float, atr: float, anchors: Dict[str, Optional[float]],
+def _stop_and_target(close: float, atr_val: float, anchors: Dict[str, Optional[float]],
                      direction: int, cfg: StructCfg) -> Tuple[Optional[float], Optional[float]]:
     poc, val, vah = anchors.get("poc"), anchors.get("val"), anchors.get("vah")
     if direction > 0:
         # stop below nearest support
         candidates = [x for x in [val, poc] if x is not None and x < close]
-        stop = max(candidates) if candidates else close - cfg.min_stop_atr*atr
+        stop = max(candidates) if candidates else close - cfg.min_stop_atr*atr_val
         # target: next resistance
-        target = vah if (vah is not None and vah > close) else (close + 2.0*atr)
+        target = vah if (vah is not None and vah > close) else (close + 2.0*atr_val)
     elif direction < 0:
         candidates = [x for x in [vah, poc] if x is not None and x > close]
-        stop = min(candidates) if candidates else close + cfg.min_stop_atr*atr
-        target = val if (val is not None and val < close) else (close - 2.0*atr)
+        stop = min(candidates) if candidates else close + cfg.min_stop_atr*atr_val
+        target = val if (val is not None and val < close) else (close - 2.0*atr_val)
     else:
         return None, None
     return float(stop), float(target)
@@ -241,7 +134,7 @@ def _rr_score(rr: float, bins: Tuple[float,float,float]) -> float:
     if rr >= a: return 10.0
     return 0.0
 
-def _trigger_quality(d: pd.DataFrame, atr: float, direction: int,
+def _trigger_quality(d: pd.DataFrame, atr_val: float, direction: int,
                      anchors: Dict[str, Optional[float]], cfg: StructCfg) -> float:
     if len(d) < 30 or direction == 0: return 8.0
     close = d["close"]; vol = d["volume"]
@@ -260,12 +153,12 @@ def _trigger_quality(d: pd.DataFrame, atr: float, direction: int,
     else:
         bonus = 8.0
     # compression breakout add-on
-    bb = _bb_width_pct(close, 20, 2.0)
+    bb = bb_width_pct(close, 20, 2.0)
     if len(bb.dropna()) >= 40:
         pct = float(pd.Series(bb).rank(pct=True).iloc[-1])
         if pct <= cfg.squeeze_pct/100.0:
             bonus += 5.0
-    return _clamp100(bonus)
+    return clamp(bonus, 0, 100)
 
 def _path_cleanliness(o: float, h: float, l: float, c: float, cfg: StructCfg) -> float:
     r = _wick_body_ratio(o,h,l,c)
@@ -275,12 +168,12 @@ def _path_cleanliness(o: float, h: float, l: float, c: float, cfg: StructCfg) ->
     t0, t1 = cfg.wick_clean_thr, cfg.wick_dirty_thr
     return float(10.0 * (1.0 - (r - t0) / max(1e-9, (t1 - t0))))
 
-def _anchor_confluence_score(close: float, atr: float, anchors: Dict[str, Optional[float]], cfg: StructCfg) -> float:
+def _anchor_confluence_score(close: float, atr_val: float, anchors: Dict[str, Optional[float]], cfg: StructCfg) -> float:
     near = 0
     for k in ("poc","val","vah"):
         v = anchors.get(k)
         if v is None: continue
-        if abs(close - float(v)) <= cfg.near_anchor_atr * atr:
+        if abs(close - float(v)) <= cfg.near_anchor_atr * atr_val:
             near += 1
     if near >= 2: return 20.0
     if near == 1: return 12.0
@@ -297,18 +190,18 @@ def _compute_structure_for_direction(d: pd.DataFrame, anchors: Dict[str, Optiona
                                      direction: int, cfg: StructCfg) -> Tuple[float, Dict[str,float], bool]:
     close = float(d["close"].iloc[-1]); o = float(d["open"].iloc[-1])
     h = float(d["high"].iloc[-1]); l = float(d["low"].iloc[-1])
-    atr = float(_atr(d["high"], d["low"], d["close"], 14).iloc[-1])
-    if atr <= 0 or direction == 0:
+    atr_val = float(atr(d["high"], d["low"], d["close"], 14).iloc[-1])
+    if atr_val <= 0 or direction == 0:
         return 50.0, {"stop":10,"reward":10,"trigger":10,"path":10,"anchor":10,"rr":1.0,"stop_atr":1.0}, False
 
-    stop, target = _stop_and_target(close, atr, anchors, direction, cfg)
+    stop, target = _stop_and_target(close, atr_val, anchors, direction, cfg)
     veto = False
     if stop is None or target is None:
         return 40.0, {"stop":5,"reward":5,"trigger":10,"path":10,"anchor":10,"rr":0.0,"stop_atr":0.0}, True
 
     risk = abs(close - stop)
     move = abs(target - close)
-    stop_atr = risk / atr if atr > 0 else 0.0
+    stop_atr = risk / atr_val if atr_val > 0 else 0.0
     rr = (move / risk) if risk > 0 else 0.0
 
     # stop viability (0–25)
@@ -324,14 +217,14 @@ def _compute_structure_for_direction(d: pd.DataFrame, anchors: Dict[str, Optiona
     reward_score = _rr_score(rr, cfg.rr_bins)
 
     # trigger (0–20)
-    trigger_score = _trigger_quality(d, atr, direction, anchors, cfg)
+    trigger_score = _trigger_quality(d, atr_val, direction, anchors, cfg)
 
     # path (0–10) + obstruction up to −5
     path_score = _path_cleanliness(o,h,l,close, cfg) + _breakout_obstruction_penalty(close, stop, target, anchors)
     path_score = max(0.0, min(10.0, path_score))  # keep within 0–10 after obstruction
 
     # anchor confluence (0–20)
-    anchor_score = _anchor_confluence_score(close, atr, anchors, cfg)
+    anchor_score = _anchor_confluence_score(close, atr_val, anchors, cfg)
 
     # hard vetoes (spec)
     if rr < cfg.veto_rr_floor:
@@ -350,7 +243,7 @@ def _compute_structure_for_direction(d: pd.DataFrame, anchors: Dict[str, Optiona
         "stop": stop_score, "reward": reward_score, "trigger": trigger_score,
         "path": path_score, "anchor": anchor_score, "rr": rr, "stop_atr": stop_atr
     }
-    return _clamp100(total), comp, veto
+    return clamp(total, 0, 100), comp, veto
 
 def _blend_scores(scores: Dict[str,float], weights: Dict[str,float]) -> float:
     if not scores: return 50.0
@@ -365,7 +258,7 @@ def _blend_scores(scores: Dict[str,float], weights: Dict[str,float]) -> float:
 
 def process_symbol(symbol: str, *, kind: str, cfg: Optional[StructCfg] = None) -> int:
     cfg = cfg or load_cfg()
-    df5 = _load_5m(symbol, kind, cfg.lookback_days)
+    df5 = load_5m(symbol, kind, cfg.lookback_days)
     if df5.empty:
         print(f"⚠️ {kind}:{symbol} no 5m data for {cfg.metric_prefix}")
         return 0
@@ -375,11 +268,10 @@ def process_symbol(symbol: str, *, kind: str, cfg: Optional[StructCfg] = None) -
     rows: List[tuple] = []
 
     for tf in cfg.tfs:
-        if tf not in TF_TO_OFFSET: continue
         dftf = resample(df5, tf)
         dftf = maybe_trim_last_bar(dftf)
         if not ensure_min_bars(dftf, tf):
-            return 0
+            continue
 
         anchors = _anchor_dict(symbol, kind, tf)
         bias = _dir_bias(dftf["close"])
@@ -425,7 +317,7 @@ def process_symbol(symbol: str, *, kind: str, cfg: Optional[StructCfg] = None) -
     # MTF blend (weighted average, and OR the veto flags)
     mtf_score = _blend_scores(per_tf_scores, cfg.mtf_weights)
     mtf_veto  = any(per_tf_vetos.get(tf, False) for tf in per_tf_scores.keys())
-    ts_latest = datetime.now(TZ)
+    ts_latest = now_ts()
     ctx_mtf = {"weights": cfg.mtf_weights, "tfs": list(per_tf_scores.keys()), "variant": cfg.metric_prefix}
 
     P = cfg.metric_prefix
@@ -434,7 +326,7 @@ def process_symbol(symbol: str, *, kind: str, cfg: Optional[StructCfg] = None) -
         (symbol, kind, "MTF", ts_latest, f"{P}.veto_flag", 1.0 if mtf_veto else 0.0, "{}",       cfg.run_id, cfg.source),
     ]
 
-    _write_rows(rows)
+    write_values(rows)
     print(f"✅ {cfg.metric_prefix} {kind}:{symbol} → mtf={mtf_score:.1f}, tf={ {k: round(v,1) for k,v in per_tf_scores.items()} } veto_mtf={mtf_veto}")
     return 1
 
@@ -451,10 +343,10 @@ def run(symbols: Optional[List[str]] = None, kinds: Iterable[str] = ("futures","
         symbols = [r[0] for r in rows or []]
 
     # NEW: allow multiple variants from INI
-    cp = configparser.ConfigParser(inline_comment_prefixes=(";","#"), interpolation=None, strict=False)
+    cp = configparser.ConfigParser(inline_comment_prefixes=(";", "#"), interpolation=None, strict=False)
     cp.read(ini_path)
     if cp.has_section("structure_runner"):
-        variants = _csv(cp.get("structure_runner", "variants", fallback="structure"))
+        variants = csv(cp.get("structure_runner", "variants", fallback="structure"))
     else:
         variants = ["structure"]  # default: old behavior
 

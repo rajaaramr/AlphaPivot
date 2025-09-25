@@ -1,42 +1,47 @@
-# File: utils/symbol_utils.py
-# Purpose: Minimal, DB-free symbol helpers driven by zerodha.ini
+# utils/symbol_utils.py
+"""
+Symbol-related utility functions for the AlphaPivot trading system.
 
+This module provides a set of helper functions for working with trading
+symbols, including formatting, validation, and generating instrument-specific
+symbols.
+"""
 from __future__ import annotations
 import os
-import configparser
 from functools import lru_cache
 from typing import Optional
 
-# Path to your ini (adjust if you keep it elsewhere)
-INI_PATH = os.environ.get("ZERODHA_INI_PATH", "zerodha.ini")
+from .configs import get_config_parser
 
 # ---------- INI helpers ----------
 
 @lru_cache(maxsize=1)
-def _cfg() -> configparser.ConfigParser:
-    cfg = configparser.ConfigParser()
-    cfg.read(INI_PATH)
-    return cfg
+def _get_config():
+    """Cached accessor for the main configuration."""
+    return get_config_parser()
 
 def get_futures_expiry_suffix() -> str:
     """
-    Read FUT expiry suffix from zerodha.ini, e.g. '25AUGFUT'.
+    Reads the futures expiry suffix (e.g., '25AUGFUT') from the [settings]
+    section of the config.ini file.
     """
-    return _cfg().get("settings", "fut_expiry_suffix", fallback="").upper().strip()
+    config = _get_config()
+    if "settings" in config and "fut_expiry_suffix" in config["settings"]:
+        return config.get("settings", "fut_expiry_suffix").upper().strip()
+    return ""
 
 # ---------- Public API (DB-free) ----------
 
 def get_spot_tradingsymbol(symbol: str) -> str:
     """
-    Canonical NSE spot symbol. DB not required.
-    If you later add an exchange map, update here.
+    Returns the canonical NSE spot symbol for a given symbol.
     """
     return (symbol or "").upper().strip()
 
 def get_futures_tradingsymbol(symbol: str) -> Optional[str]:
     """
-    Build futures tradingsymbol using suffix from zerodha.ini.
-    Returns None if suffix is not configured.
+    Builds a futures tradingsymbol using the suffix from config.ini.
+
     Example: 'INFY' + '25AUGFUT' -> 'INFY25AUGFUT'
     """
     base = get_spot_tradingsymbol(symbol)
@@ -47,26 +52,24 @@ def get_futures_tradingsymbol(symbol: str) -> Optional[str]:
 
 def get_option_symbol_base(symbol: str) -> str:
     """
-    For callers that previously reused the FUT base for options:
-    returns '<SYMBOL><FUT_SUFFIX>' (e.g., 'INFY25AUGFUT' -> you can
-    replace 'FUT' with strike/CE/PE in your option builder).
-    If you move to instruments cache for options, you can retire this.
+    Generates the base symbol for an option contract.
     """
     fut = get_futures_tradingsymbol(symbol)
     return fut or ""
 
 def get_lot_size(symbol: str) -> int:
     """
-    Placeholder (DB-free). Return 1 by default.
-    If you create a metadata table later, wire it here.
+    Placeholder for returning the lot size of a symbol.
     """
     return 1
 
 # ---------- Convenience ----------
 
 def is_index(symbol: str) -> bool:
+    """Checks if a symbol is an index."""
     return get_spot_tradingsymbol(symbol) in {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
 
 def is_valid_tradingsymbol(symbol: str) -> bool:
+    """Checks if a symbol is a valid futures tradingsymbol."""
     s = (symbol or "").upper().strip()
     return s.endswith("FUT") and len(s) > 10

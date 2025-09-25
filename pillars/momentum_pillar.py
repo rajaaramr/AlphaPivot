@@ -14,12 +14,6 @@ from pillars.common import min_bars_for_tf, ensure_min_bars, maybe_trim_last_bar
 # -----------------------------
 # Local helpers
 # -----------------------------
-def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
-    d = close.diff()
-    g = d.clip(lower=0); l = (-d).clip(lower=0)
-    rs = g.ewm(alpha=1/n, adjust=False).mean() / (l.ewm(alpha=1/n, adjust=False).mean().replace(0, np.nan))
-    return 100 - 100/(1+rs)
-
 def _rmi(close: pd.Series, lb: int = 14, m: int = 5) -> pd.Series:
     diffm = close.diff(m)
     up = diffm.clip(lower=0); dn = (-diffm).clip(lower=0)
@@ -122,8 +116,8 @@ def _mom_features(dtf: pd.DataFrame, cfg: dict) -> Dict[str, float | int | bool]
     atr_avg_20 = float(ATR.rolling(20).mean().iloc[-1]) if len(ATR) >= 20 else atr_val
 
     # RSI fast/std
-    rsi_fast = _rsi(c, cfg["rsi_fast"])
-    rsi_std  = _rsi(c, cfg["rsi_std"])
+    rsi_fast = rsi(c, cfg["rsi_fast"])
+    rsi_std  = rsi(c, cfg["rsi_std"])
 
     # RMI
     rmi     = _rmi(c, lb=cfg["rmi_lb"], m=cfg["rmi_m"])
@@ -271,12 +265,6 @@ def _mom_features(dtf: pd.DataFrame, cfg: dict) -> Dict[str, float | int | bool]
     return feat
 
 
-def _eval_expr(expr: str, F: dict) -> bool:
-    if not expr:
-        return False
-    return bool(eval(expr, {"__builtins__": None}, {k: F[k] for k in F}))
-
-
 # -----------------------------
 # Base momentum scorer (unchanged behavior)
 # -----------------------------
@@ -295,8 +283,8 @@ def _momentum_score_base(dtf: pd.DataFrame, cfg: dict) -> Tuple[float, Dict[str,
     else:
         rsi_thr = 70
 
-    rsi_fast = _rsi(c, cfg["rsi_fast"])
-    rsi_std  = _rsi(c, cfg["rsi_std"])
+    rsi_fast = rsi(c, cfg["rsi_fast"])
+    rsi_std  = rsi(c, cfg["rsi_std"])
 
     # RMI adaptive
     rmi_lb = 9 if atr_pct > cfg["mid_vol_thr"] else (21 if atr_pct < cfg["low_vol_thr"] else cfg["rmi_lb"])
@@ -427,10 +415,10 @@ def score_momentum(symbol: str, kind: str, tf: str, df5: pd.DataFrame, base: Bas
         F = _mom_features(dftf, cfg)
         scen_total = 0.0
         for sc in scenarios:
-            if _eval_expr(sc["when"], F):
+            if eval_expr(sc["when"], F):
                 scen_total += sc["score"]
                 parts[f"SCN.{sc['name']}"] = float(sc["score"])
-                if sc.get("bonus_when") and _eval_expr(sc["bonus_when"], F):
+                if sc.get("bonus_when") and eval_expr(sc["bonus_when"], F):
                     scen_total += sc["bonus"]
                     parts[f"SCN.{sc['name']}.bonus"] = float(sc["bonus"])
 

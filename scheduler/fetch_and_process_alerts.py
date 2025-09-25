@@ -1,17 +1,16 @@
-# File: utils/fetch_and_process_alerts.py
-# Purpose: Claim pending webhooks (Postgres/Timescale), build context (futures/zones),
-#          evaluate entries/exits, write journal rows (futures-first) and log attempts.
-# Notes:
-#   - ENTRY: stores futures entry price, rule & score, and the chosen nearest option (CE/PE)
-#   - EXIT : computes PnL on futures only
-#   - Webhooks: expects signal in payload JSON (buy/long/sell/short/close)
+# scheduler/fetch_and_process_alerts.py
+"""
+Webhook Alert Processor for the AlphaPivot Trading System.
 
+This module is responsible for processing pending webhook alerts, evaluating
+them against a set of rules, and creating trade entries in the journal and
+the decisions_live table.
+"""
 from __future__ import annotations
 
-import configparser
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from kiteconnect import KiteConnect
 
@@ -20,44 +19,30 @@ from utils.kite_utils import fetch_futures_data
 from utils.rule_evaluator import evaluate_alert
 from utils.exit_rule_evaluator import evaluate_exit
 from utils.option_strikes import pick_nearest_option
-from utils.db_ops import fetch_latest_zone_data  # your existing impl; keep it for zone context
+from utils.db_ops import fetch_latest_zone_data
+from utils.kite_session import load_kite
 
-# NEW – config-driven, multi-TF scores
-from utils.indicators import compute_weighted_scores, load_indicator_config
-
-# NEW – futures & option-chain buildup (kept separate)
-from utils.buildups import compute_futures_buildup, compute_optionchain_buildup
-
-# OPTIONAL – single call that merges indicators + buildups + recompute final score
-from utils.compose_signals import compose_blob
-
-# OPTIONAL – if you persist JSONB indicator snapshots for the dashboard
-from utils.db_ops import insert_indicator_snapshot, json_dumps
-
-
-# ---------------- Config ----------------
-CONFIG_PATH = "zerodha.ini"
-RULE_ENGINE_VERSION = "v1.2.4"
+# ---------------- Config / constants ----------------
 BATCH_SIZE = 100
 TZ = timezone.utc
-
 
 # ------------- Types --------------------
 @dataclass
 class Alert:
+    """Represents a trading alert fetched from the database."""
     unique_id: str
     symbol: str
     strategy: str
     payload: Optional[dict]
     received_at: datetime
 
-
 # ------------- Utils --------------------
 def _utcnow() -> datetime:
+    """Returns the current time in UTC."""
     return datetime.now(tz=TZ)
 
-
 def _side_from_signal(signal_type: Optional[str]) -> Optional[str]:
+    """Determines the trade side from a signal string."""
     if not signal_type:
         return None
     s = signal_type.strip().lower()
@@ -69,23 +54,9 @@ def _side_from_signal(signal_type: Optional[str]) -> Optional[str]:
         return "CLOSE"
     return None
 
-
-def load_kite_session() -> KiteConnect:
-    cfg = configparser.ConfigParser()
-    cfg.read(CONFIG_PATH)
-    api_key = cfg["kite"]["api_key"]
-    access_token = cfg["kite"]["access_token"]
-    kite = KiteConnect(api_key=api_key)
-    kite.set_access_token(access_token)
-    return kite
-
-
 # --------- DB helpers (Timescale) --------
 def _claim_pending_alerts(cur) -> List[Alert]:
-    """
-    Atomically claim up to BATCH_SIZE pending alerts by flipping to PROCESSING
-    and returning the claimed rows (avoids races).
-    """
+    """Atomically claims a batch of pending alerts for processing."""
     sql = """
     UPDATE webhooks.webhook_alerts AS w
        SET status = 'PROCESSING',
@@ -108,14 +79,12 @@ def _claim_pending_alerts(cur) -> List[Alert]:
         alerts.append(Alert(str(uid), sym, strat or "UNKNOWN", payload_dict, rcvd))
     return alerts
 
-
 def _next_attempt_number(cur, unique_id: str) -> int:
     cur.execute(
         "SELECT COALESCE(MAX(attempt_number),0) FROM journal.rejections_log WHERE unique_id=%s;",
         (unique_id,)
     )
     return int(cur.fetchone()[0] or 0) + 1
-
 
 def _log_attempt(cur, unique_id: str, attempt_number: int, status: str,
                  rejection_reason: Optional[str] = None, trigger: Optional[str] = None, notes: Optional[str] = None):
@@ -127,7 +96,6 @@ def _log_attempt(cur, unique_id: str, attempt_number: int, status: str,
         """,
         (unique_id, attempt_number, status, rejection_reason, trigger, notes)
     )
-
 
 def _finalize_alert(cur, unique_id: str, status: str, rejection_reason: Optional[str] = None):
     cur.execute(
@@ -141,8 +109,6 @@ def _finalize_alert(cur, unique_id: str, status: str, rejection_reason: Optional
         (status, rejection_reason, unique_id)
     )
 
-
-# -------- Journal helpers (futures-led) -------
 def _insert_entry(cur,
                   unique_id: str,
                   symbol: str,
@@ -152,9 +118,10 @@ def _insert_entry(cur,
                   decision_score: Optional[float],
                   option_type: Optional[str],
                   option_strike: Optional[float],
-                  option_symbol: Optional[str]):
+                  option_symbol: Optional[str],
+                  market_data: Dict):
     """
-    Minimal OPEN trade row on accept, storing futures price and chosen option meta.
+    Inserts a new trade entry into the journal and creates a decision record.
     """
     cur.execute(
         """
@@ -163,21 +130,28 @@ def _insert_entry(cur,
              entry_price_fut, rule_matched, decision_score,
              option_type, option_strike, option_symbol,
              status)
-        VALUES (%s,%s,%s, now(),
-                %s,%s,%s,
-                %s,%s,%s,
-                'OPEN');
+        VALUES (%s,%s,%s, now(), %s,%s,%s, %s,%s,%s, 'OPEN');
         """,
-        (unique_id, symbol, side,
-         entry_price_fut, rule_matched, float(decision_score or 0),
-         option_type, option_strike, option_symbol)
+        (unique_id, symbol, side, entry_price_fut, rule_matched,
+         float(decision_score or 0), option_type, option_strike, option_symbol)
     )
 
+    if entry_price_fut:
+        stop_px = entry_price_fut * 0.99 if side == "LONG" else entry_price_fut * 1.01
+        target_px = entry_price_fut * 1.02 if side == "LONG" else entry_price_fut * 0.98
+
+        cur.execute(
+            """
+            INSERT INTO analytics.decisions_live
+                (symbol, ts, bias, fut_close, stop_px, target_1r, composite, status, instrument)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'OPEN_SETUP', %s)
+            ON CONFLICT (symbol, ts) DO NOTHING;
+            """,
+            (symbol, _utcnow(), f"{side}_SETUP", entry_price_fut, stop_px, target_px,
+             decision_score, "FUTURES")
+        )
 
 def _fetch_latest_open_trade(cur, symbol: str):
-    """
-    Returns (trade_id, side, entry_price_fut) for latest OPEN trade of symbol (or None).
-    """
     cur.execute(
         """
         SELECT trade_id, side, entry_price_fut
@@ -190,7 +164,6 @@ def _fetch_latest_open_trade(cur, symbol: str):
     )
     return cur.fetchone()
 
-
 def _close_trade(cur, trade_id: int, exit_price_fut: float, reason: str,
                  score: float, exit_direction: str, entry_side: Optional[str], entry_price_fut: Optional[float]):
     side = (entry_side or "LONG").upper()
@@ -201,33 +174,19 @@ def _close_trade(cur, trade_id: int, exit_price_fut: float, reason: str,
     cur.execute(
         """
         UPDATE journal.trading_journal
-           SET exit_ts       = now(),
-               exit_price_fut= %s,
-               exit_reason   = %s,
-               decision_score= %s,
-               status        = 'CLOSED',
-               pnl           = %s,
-               pnl_pct       = %s,
-               exit_direction= %s
+           SET exit_ts = now(), exit_price_fut= %s, exit_reason = %s,
+               decision_score = %s, status = 'CLOSED', pnl = %s,
+               pnl_pct = %s, exit_direction = %s
          WHERE trade_id = %s;
         """,
         (exit_price_fut, reason, float(score or 0), pnl_raw, pnl_pct, exit_direction, trade_id)
     )
 
-
-# ------------- Context build ----------------
 def _preprocess_alert(symbol: str, kite: KiteConnect):
-    """
-    Build minimal context for evaluation:
-      - futures LTP + volume
-      - latest zone info (VAL/VAH, flags) via your existing db_ops.fetch_latest_zone_data
-    """
     fut = fetch_futures_data(symbol, kite)
     if not fut:
         return None, "Futures data unavailable"
-
     zone = fetch_latest_zone_data(symbol) or {}
-
     return {
         "future_price": float(fut.get("last_price") or 0),
         "volume": int(fut.get("volume") or 0),
@@ -237,11 +196,8 @@ def _preprocess_alert(symbol: str, kite: KiteConnect):
         "zone_conf_score": zone.get("zone_confidence_score"),
     }, None
 
-
-# ------------- Main runner ------------------
 def process_webhook_alerts() -> None:
-    kite = load_kite_session()
-
+    kite = load_kite()
     with get_db_connection() as conn, conn.cursor() as cur:
         alerts = _claim_pending_alerts(cur)
         if not alerts:
@@ -257,12 +213,9 @@ def process_webhook_alerts() -> None:
                 signal_type = payload.get("signal_type") or payload.get("signal")
                 side = _side_from_signal(signal_type)
 
-                # Build/cache context for the symbol
-                if a.symbol in symbol_ctx_cache:
-                    ctx, ctx_err = symbol_ctx_cache[a.symbol]
-                else:
-                    ctx, ctx_err = _preprocess_alert(a.symbol, kite)
-                    symbol_ctx_cache[a.symbol] = (ctx, ctx_err)
+                if a.symbol not in symbol_ctx_cache:
+                    symbol_ctx_cache[a.symbol] = _preprocess_alert(a.symbol, kite)
+                ctx, ctx_err = symbol_ctx_cache[a.symbol]
 
                 attempt = _next_attempt_number(cur, a.unique_id)
 
@@ -270,80 +223,46 @@ def process_webhook_alerts() -> None:
                     reason = ctx_err or "context missing"
                     _log_attempt(cur, a.unique_id, attempt, status="rejected", rejection_reason=reason)
                     _finalize_alert(cur, a.unique_id, "REJECTED", rejection_reason=reason)
-                    print(f"⚠️ Skipping {a.symbol} — {reason}")
                     continue
 
-                # ---------------- EXIT flow ----------------
                 if side == "CLOSE":
                     should_close, reason, score = evaluate_exit(a.symbol)
                     if should_close:
                         row = _fetch_latest_open_trade(cur, a.symbol)
                         if row:
                             trade_id, entry_side, entry_price_fut = row
-                            _close_trade(
-                                cur,
-                                trade_id=trade_id,
-                                exit_price_fut=float(ctx["future_price"]),
-                                reason=reason,
-                                score=float(score or 0),
-                                exit_direction="CLOSE",
-                                entry_side=entry_side,
-                                entry_price_fut=entry_price_fut,
-                            )
+                            _close_trade(cur, trade_id, float(ctx["future_price"]), reason, score, "CLOSE", entry_side, entry_price_fut)
                             _log_attempt(cur, a.unique_id, attempt, status="accepted", notes=f"exit: {reason}")
                             _finalize_alert(cur, a.unique_id, "ACCEPTED")
-                            print(f"🔚 EXITED: {a.symbol} | {reason}")
                         else:
-                            msg = "No OPEN trade found"
-                            _log_attempt(cur, a.unique_id, attempt, status="rejected", rejection_reason=msg)
-                            _finalize_alert(cur, a.unique_id, "REJECTED", rejection_reason=msg)
-                            print(f"⚠️ EXIT REJECTED: {a.symbol} | {msg}")
+                            _log_attempt(cur, a.unique_id, attempt, status="rejected", rejection_reason="No OPEN trade found")
+                            _finalize_alert(cur, a.unique_id, "REJECTED", rejection_reason="No OPEN trade found")
                     else:
                         _log_attempt(cur, a.unique_id, attempt, status="rejected", rejection_reason=reason)
                         _finalize_alert(cur, a.unique_id, "REJECTED", rejection_reason=reason)
-                        print(f"⚠️ EXIT REJECTED: {a.symbol} | {reason}")
                     continue
 
-                # ---------------- ENTRY flow ----------------
-                is_valid, rule_matched, failed_rules, score, decision_tags = evaluate_alert(a.symbol)
+                is_valid, rule_matched, failed_rules, score, decision_tags, market_data = evaluate_alert(a.symbol)
 
                 if is_valid:
                     entry_side = side or "LONG"
                     fut_price = float(ctx["future_price"])
-
-                    # CE for LONG, PE for SHORT — pick nearest strike at nearest expiry
                     opt_type = "CE" if entry_side == "LONG" else "PE"
-                    expiry, strike, tsym = pick_nearest_option(
-                        a.symbol, kite, target_price=fut_price, option_type=opt_type
-                    )
 
-                    _insert_entry(
-                        cur,
-                        unique_id=a.unique_id,
-                        symbol=a.symbol,
-                        side=entry_side,
-                        entry_price_fut=fut_price,
-                        rule_matched=rule_matched,
-                        decision_score=float(score or 0),
-                        option_type=opt_type if tsym else None,
-                        option_strike=float(strike) if strike else None,
-                        option_symbol=tsym
-                    )
+                    option_info = pick_nearest_option(a.symbol, kite, target_price=fut_price, option_type=opt_type)
+                    expiry, strike, tsym = (option_info.expiry, option_info.strike, option_info.tradingsymbol) if option_info else (None, None, None)
 
-                    _log_attempt(cur, a.unique_id, attempt, status="accepted",
-                                 notes=f"rule={rule_matched}, score={score}, opt={opt_type}@{strike} {tsym or ''}".strip())
+                    _insert_entry(cur, a.unique_id, a.symbol, entry_side, fut_price, rule_matched, score, opt_type, strike, tsym, market_data)
+                    _log_attempt(cur, a.unique_id, attempt, status="accepted", notes=f"rule={rule_matched}, score={score}, opt={opt_type}@{strike} {tsym or ''}".strip())
                     _finalize_alert(cur, a.unique_id, "ACCEPTED")
-                    print(f"✅ ENTRY: {a.symbol} | {a.strategy} | {entry_side} | {rule_matched} | {opt_type} {strike} {tsym}")
                 else:
                     reason_text = "; ".join(f"{r}: {rsn}" for (r, rsn) in (failed_rules or [])) or "Rules not met"
                     _log_attempt(cur, a.unique_id, attempt, status="rejected", rejection_reason=reason_text)
                     _finalize_alert(cur, a.unique_id, "REJECTED", rejection_reason=reason_text)
-                    print(f"⛔ ENTRY REJECTED: {a.symbol} | score={score} | {reason_text}")
             except Exception as row_err:
-                print(f"⚠️ [{a.symbol}] Insert fail for {a.symbol}: {row_err}")
+                print(f"⚠️ [{a.symbol}] Insert fail: {row_err}")
 
         print("📝 Processing complete.")
-
 
 if __name__ == "__main__":
     process_webhook_alerts()

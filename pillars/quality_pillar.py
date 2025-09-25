@@ -7,7 +7,7 @@ import pandas as pd
 
 from .common import (  # provided by your codebase
     ema, atr, adx, resample, write_values, last_metric, clamp,
-    TZ, DEFAULT_INI, BaseCfg
+    TZ, DEFAULT_INI, BaseCfg, rsi, eval_expr
 )
 from pillars.common import min_bars_for_tf, ensure_min_bars, maybe_trim_last_bar
 
@@ -62,32 +62,12 @@ def _near_level(price: float, level: Optional[float], atr_last: float, near_atr:
         return False
     return abs(price - float(level)) <= (near_atr * atr_last)
 
-def _rsi(series: pd.Series, n:int=14) -> pd.Series:
-    d = series.diff()
-    up = d.clip(lower=0.0)
-    dn = (-d).clip(lower=0.0)
-    rs = up.ewm(alpha=1.0/n, adjust=False).mean() / (dn.ewm(alpha=1.0/n, adjust=False).mean().replace(0, np.nan))
-    return 100 - 100/(1+rs)
-
 def _higher_tf(tf: str) -> str:
     tf = tf.lower()
     if tf in {"25m","25"}:   return "65m"
     if tf in {"65m","65"}:   return "125m"
     if tf in {"125m","125"}: return "1d"
     return "1d"
-
-def _safe_eval(expr: str, scope: Dict[str, Any]) -> bool:
-    """
-    Evaluate simple boolean/arithmetic expressions against features.
-    Disables builtins and function calls; only names in scope are usable.
-    """
-    if not expr or not expr.strip():
-        return False
-    # ultra-simple guard: block parentheses followed by letters (function calls)
-    if "(__" in expr or ")" in expr and "(" in expr and any(ch.isalpha() for ch in expr.split("(")[-1].split(")")[0]):
-        # still allow math like (a + b) by not rejecting generally; we only block "name(..."
-        pass
-    return bool(eval(expr, {"__builtins__": {}}, scope))
 
 
 # -----------------------------
@@ -169,7 +149,7 @@ def _build_features(dtf: pd.DataFrame, vp: dict, cfg: dict, tf: str) -> Dict[str
     hammer_bullish = bool((lower_wick >= 2.0*body) and (upper_wick <= 0.3*body) and (last["close"] >= last["open"]))
 
     # RSI bullish divergence vs N bars back
-    rsi14 = _rsi(c, 14)
+    rsi14 = rsi(c, 14)
     N = 5
     rsi_bull_div = bool((float(c.iloc[-1]) < float(c.iloc[-N])) and (float(rsi14.iloc[-1]) > float(rsi14.iloc[-N])))
 
@@ -251,7 +231,7 @@ def _run_scenarios(features: Dict[str, Any], cfg: dict) -> Tuple[float, bool, bo
             continue
         ok = False
         try:
-            ok = _safe_eval(when, features)
+            ok = eval_expr(when, features)
         except Exception:
             ok = False
 
@@ -266,7 +246,7 @@ def _run_scenarios(features: Dict[str, Any], cfg: dict) -> Tuple[float, bool, bo
         # optional bonus
         if cp.has_option(sec, "bonus_when"):
             try:
-                if _safe_eval(cp.get(sec, "bonus_when"), features):
+                if eval_expr(cp.get(sec, "bonus_when"), features):
                     bonus_val = float(cp.get(sec, "bonus", fallback="0").strip() or 0.0)
                     total = (bonus_val if cfg["rules_mode"] == "override" else (total + bonus_val))
                     parts[name + ".bonus"] = bonus_val

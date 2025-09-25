@@ -4,7 +4,7 @@ import json, math, configparser
 from typing import Optional, Tuple, Dict, Any, List
 import numpy as np
 import pandas as pd
-from .common import *  # ema, atr, adx, bb_width_pct, resample, write_values, last_metric, clamp, TZ, DEFAULT_INI, BaseCfg
+from .common import *  # ema, atr, adx, bb_width_pct, resample, write_values, last_metric, clamp, TZ, DEFAULT_INI, BaseCfg, eval_expr, eval_expr_num
 from pillars.common import min_bars_for_tf, ensure_min_bars, maybe_trim_last_bar
 
 # -----------------------------
@@ -100,35 +100,18 @@ def _reward_points(rr: float, rr_bins: Tuple[float,float,float]) -> float:
     if rr >= a: return 10.0
     return 0.0
 
-# ---- tiny safe-eval for scenarios ----
-_ALLOWED_NAMES = set("""
-stop_atr rr trig pos_frac total_expo avg_corr sector_conc
-near_vah near_poc vol_ok squeeze_rank
-atr_last price rvol_now
-""".split())
-
-def _safe_eval(expr: str, vars: Dict[str, Any]) -> bool:
-    if not expr: return False
-    # only allow our variables + numbers + operators
-    # we rely on Python eval with no builtins and our dict
-    return bool(eval(expr, {"__builtins__": {}}, vars))
-
-def _eval_number(expr: str, vars: Dict[str, Any]) -> float:
-    if not expr: return 0.0
-    return float(eval(expr, {"__builtins__": {}}, vars))
-
 def _apply_scenarios(cfg: dict, vars: Dict[str, Any]) -> Tuple[float, bool, list]:
     """Return (delta_points, set_veto, hits[])"""
     total = 0.0; veto = False; hits = []
     for s in cfg.get("scenarios", []):
         try:
-            cond = _safe_eval(s.get("when",""), vars)
+            cond = eval_expr(s.get("when",""), vars)
         except Exception:
             cond = False
         if cond:
             pts = 0.0
             try:
-                pts = _eval_number(s.get("score","0"), vars)
+                pts = eval_expr_num(s.get("score","0"), vars)
             except Exception:
                 pts = 0.0
             # optional bonus_when / bonus
@@ -136,8 +119,8 @@ def _apply_scenarios(cfg: dict, vars: Dict[str, Any]) -> Tuple[float, bool, list
             bw = s.get("bonus_when","").strip()
             if bw:
                 try:
-                    if _safe_eval(bw, vars):
-                        bonus_add = _eval_number(s.get("bonus","0"), vars)
+                    if eval_expr(bw, vars):
+                        bonus_add = eval_expr_num(s.get("bonus","0"), vars)
                 except Exception:
                     bonus_add = 0.0
             total += (pts + bonus_add)

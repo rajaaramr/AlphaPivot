@@ -1,33 +1,49 @@
 # File: utils/compose_signals.py
+"""
+Signal Composition Module for the AlphaPivot Trading System.
+
+This module is responsible for composing the final trading signal by combining
+various data sources, including technical indicators and market buildup data.
+"""
 from __future__ import annotations
 from typing import Dict
 
-from utils.indicators import compute_weighted_scores, load_indicator_config
-from utils.buildups import compute_futures_buildup, compute_optionchain_buildup
+import pandas as pd
 
-def compose_blob(dfs_by_tf: Dict[str, "pd.DataFrame"], symbol: str, ini_path: str = "indicators.ini") -> Dict:
-    cfg = load_indicator_config(ini_path)
-    blob = compute_weighted_scores(dfs_by_tf, ini_path)  # has rsi/rmi and .score
+from .indicators import compute_indicators
+from .buildups import compute_futures_buildup, compute_optionchain_buildup
+from .configs import get_config_parser
+
+def compose_blob(dfs_by_tf: Dict[str, pd.DataFrame], symbol: str) -> Dict:
+    """
+    Composes a comprehensive signal blob for a given symbol.
+
+    This function combines technical indicators, futures buildup, and option
+    chain buildup data into a single dictionary, which can be used for
+    generating trading decisions.
+
+    Args:
+        dfs_by_tf: A dictionary of pandas DataFrames, keyed by timeframe.
+        symbol: The trading symbol.
+
+    Returns:
+        A dictionary containing the composed signal blob.
+    """
+    config = get_config_parser()
+
+    # We can compute indicators on the fly for the required timeframes
+    blob = {}
+    for tf, df in dfs_by_tf.items():
+        blob[tf] = compute_indicators(df)
 
     fut = compute_futures_buildup(symbol)
-    oc  = compute_optionchain_buildup(symbol)
+    oc = compute_optionchain_buildup(symbol)
 
     blob["fut_buildup"] = fut
-    blob["oc_buildup"]  = oc
+    blob["oc_buildup"] = oc
 
-    # recompute final confidence including buildups if weights provided
-    num = den = 0.0
-    # Start with the rsi/rmi mix already inside blob["score"]
-    base_w = (cfg.weights.get("rsi", 0.0) + cfg.weights.get("rmi", 0.0))
-    if base_w > 0 and blob.get("score") is not None:
-        num += base_w * float(blob["score"])
-        den += base_w
+    # The final score composition logic that was here previously
+    # has been moved to the pillars/composite_worker_v2.py module.
+    # This module now focuses solely on composing the raw data blob.
 
-    for name in ("fut_buildup", "oc_buildup"):
-        w = cfg.weights.get(name, 0.0)
-        s = (blob.get(name) or {}).get("score")
-        if w > 0 and s is not None:
-            num += w * float(s); den += w
-
-    blob["score"] = round(num/den, 2) if den > 0 else blob.get("score")
     return blob

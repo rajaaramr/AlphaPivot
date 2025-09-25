@@ -259,7 +259,7 @@ def _parse_weights(s: str, tfs: List[str]) -> Dict[str, float]:
 def weighted_avg(values: Dict[str, float], weights: Dict[str, float]) -> float:
     s = w = 0.0
     for tf, val in values.items():
-        if val is None: 
+        if val is None:
             continue
         wt = float(weights.get(tf, 0.0))
         s += wt * float(val); w += wt
@@ -283,3 +283,39 @@ def last_bar_rank_pct(s: pd.Series, window:int=60) -> float:
         return float(w.rank(pct=True).iloc[-1])
     except Exception:
         return 0.5
+
+# ---------- Refactored utils (moved from pillars) ----------
+
+def rsi(series: pd.Series, win: int = 14) -> pd.Series:
+    """Relative Strength Index"""
+    delta = series.diff()
+    up = delta.clip(lower=0.0)
+    down = (-delta).clip(lower=0.0)
+    roll_up = up.ewm(alpha=1.0 / win, adjust=False).mean()
+    roll_down = down.ewm(alpha=1.0 / win, adjust=False).mean()
+    rs = roll_up / roll_down.replace(0, np.nan)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+def eval_expr(expr: str, features: dict) -> bool:
+    """Safely evaluate a rule expression against a flat feature dictionary."""
+    if not expr:
+        return False
+    # Basic sandboxing
+    safe_globals = {"__builtins__": None}
+    safe_locals = dict(features)
+    try:
+        return bool(eval(expr, safe_globals, safe_locals))
+    except Exception:
+        return False
+
+def eval_expr_num(expr: str, features: dict, default: float = 0.0) -> float:
+    """Safely evaluate a rule expression against a flat feature dictionary and return a number."""
+    if not expr:
+        return default
+    # Basic sandboxing
+    safe_globals = {"__builtins__": None}
+    safe_locals = dict(features)
+    try:
+        return float(eval(expr, safe_globals, safe_locals))
+    except Exception:
+        return default
